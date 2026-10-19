@@ -1,40 +1,53 @@
 const Jimp = require('jimp');
 
+// Memória em escopo global da função serverless
+let bancoDeCupons = [];
+
 exports.handler = async (event) => {
     // ---------------------------------------------------------------------
     // 1. CREDENCIAIS E CONFIGURAÇÕES
     // ---------------------------------------------------------------------
     const TELEGRAM_TOKEN  = (process.env.TELEGRAM_TOKEN || "8309547479:AAFsKIWFZXo_P-_8EFOKHbguLK0x-FHrSwk").trim();
-    const DESTINO_ID      = (process.env.TELEGRAM_DESTINO_ID || "-1003995114810").trim();
+    const DESTINO_ID      = (process.env.TELEGRAM_DESTINO_ID || "-1003995114810").trim(); // Chat/Grupo de destino
 
-    // LINK FIXO DE AFILIADO
+    // SEU LINK FIXO DE AFILIADO SHOPEE PARA SUBSTITUIÇÃO
     const LINK_AFILIADO_FIXO = "https://s.shopee.com.br/qgzuF8WWh";
+
+    // LINK RAW OFICIAL DA IMAGEM NO SEU GITHUB
+    const URL_IMAGEM_GITHUB = "https://raw.githubusercontent.com/piccolojpg-18/gerador-whatsapp/main/imagem.jpg";
+
+    const GREEN_API_URL   = "https://7107.api.greenapi.com";
+    const GREEN_INSTANCE  = "710722716500";
+    const GREEN_TOKEN     = "993528f5ad8a470aa234774dc361ae4beaec1cc875cb460ea4";
+
+    const WHATSAPP_CHAT_IDS = [
+        process.env.GREEN_CHAT_ID_1 || "120363418129195027@g.us",
+        process.env.GREEN_CHAT_ID_2 || "120363402975417220@g.us",
+        process.env.GREEN_CHAT_ID_3 || "120363421498616404@g.us"
+    ]
+    .map(id => (id || "").trim())
+    .filter(id => id.length > 0);
 
     // ---------------------------------------------------------------------
     // 2. FUNÇÕES AUXILIARES DE IMAGEM E ENVIO
     // ---------------------------------------------------------------------
 
-    // Baixa a foto do Telegram e retorna Buffer
-    async function baixarFotoTelegram(fileId) {
+    // Baixa a imagem diretamente do GitHub (Raw) como Buffer
+    async function carregarImagemGitHub() {
         try {
-            const resFile = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`);
-            const dataFile = await resFile.json();
-           
-            if (dataFile.ok && dataFile.result && dataFile.result.file_path) {
-                const urlDownload = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${dataFile.result.file_path}`;
-                const resImg = await fetch(urlDownload);
-                return {
-                    buffer: Buffer.from(await resImg.arrayBuffer()),
-                    urlOriginal: urlDownload
-                };
+            const resImg = await fetch(URL_IMAGEM_GITHUB);
+            if (resImg.ok) {
+                return Buffer.from(await resImg.arrayBuffer());
+            } else {
+                console.error("❌ Erro ao baixar imagem do GitHub. Status:", resImg.status);
             }
         } catch (err) {
-            console.error("❌ Erro ao baixar foto do Telegram:", err);
+            console.error("❌ Erro de rede ao buscar imagem do GitHub:", err);
         }
         return null;
     }
 
-    // Corta a imagem (remove bordas rosas)
+    // Recorta exatamente o quadrado do produto, removendo bordas rosas, topo e rodapé
     async function cortarImagemProduto(bufferOriginal) {
         try {
             const image = await Jimp.read(bufferOriginal);
@@ -42,10 +55,11 @@ exports.handler = async (event) => {
             const largura = image.getWidth();
             const altura = image.getHeight();
 
-            const pctTopo = 0.075;    
-            const pctBase = 0.315;    
-            const pctEsquerda = 0.11; 
-            const pctDireita = 0.11;  
+            // Percentuais de corte exatos
+            const pctTopo = 0.075;    // Corta topo rosa (7.5%)
+            const pctBase = 0.315;    // Corta texto, preço e rodapé rosa (31.5%)
+            const pctEsquerda = 0.11; // Corta lateral esquerda rosa (11%)
+            const pctDireita = 0.11;  // Corta lateral direita rosa (11%)
 
             const inicioX = Math.floor(largura * pctEsquerda);
             const inicioY = Math.floor(altura * pctTopo);
@@ -57,12 +71,12 @@ exports.handler = async (event) => {
 
             return await image.getBufferAsync(Jimp.MIME_JPEG);
         } catch (err) {
-            console.error("❌ Erro no Jimp ao cortar:", err);
-            return bufferOriginal; // Retorna a foto sem corte caso o Jimp falhe
+            console.error("❌ Erro no processamento com Jimp:", err);
+            return bufferOriginal;
         }
     }
 
-    // Envia foto para o Telegram usando multipart/form-data via Boundary
+    // Envia imagem (Buffer) para o Telegram com Boundary manual
     async function enviarFotoTelegram(chatId, bufferFoto, legenda) {
         if (!TELEGRAM_TOKEN) return;
         try {
@@ -74,6 +88,7 @@ exports.handler = async (event) => {
             if (legenda) {
                 header += `--${boundary}\r\n`;
                 header += `Content-Disposition: form-data; name="caption"\r\n\r\n${legenda}\r\n`;
+                header += `Content-Disposition: form-data; name="parse_mode"\r\n\r\nMarkdown\r\n`;
             }
             
             header += `--${boundary}\r\n`;
@@ -99,27 +114,56 @@ exports.handler = async (event) => {
             const resJson = await response.json();
             if (!resJson.ok) {
                 console.error("❌ Telegram rejeitou a foto:", resJson);
-                // Fallback: tenta enviar só texto se a foto falhar
                 await enviarTextoTelegram(chatId, legenda);
             } else {
                 console.log("✅ Foto enviada com sucesso para o Telegram!");
             }
         } catch (err) {
-            console.error(`❌ Erro ao disparar foto para Telegram (${chatId}):`, err);
+            console.error(`❌ Erro foto Telegram (${chatId}):`, err);
             await enviarTextoTelegram(chatId, legenda);
         }
     }
 
+    // Envia texto simples para o Telegram
     async function enviarTextoTelegram(chatId, texto) {
         if (!TELEGRAM_TOKEN) return;
         try {
             await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: chatId, text: texto })
+                body: JSON.stringify({ chat_id: chatId, text: texto, parse_mode: 'Markdown' })
             });
         } catch (err) {
             console.error(`❌ Erro texto Telegram (${chatId}):`, err);
+        }
+    }
+
+    // Envia mensagem/foto para o WhatsApp via Green-API (Atualmente bloqueado/desativado)
+    async function enviarWhatsapp(texto, chatId, bufferFoto = null) {
+        const endpoint = bufferFoto ? "sendFileByUpload" : "sendMessage";
+        const url = `${GREEN_API_URL}/waInstance${GREEN_INSTANCE}/${endpoint}/${GREEN_TOKEN}`;
+
+        try {
+            if (bufferFoto) {
+                const formData = new FormData();
+                formData.append('chatId', chatId);
+                formData.append('caption', texto);
+                const blob = new Blob([bufferFoto], { type: 'image/jpeg' });
+                formData.append('file', blob, 'oferta.jpg');
+
+                const resp = await fetch(url, { method: 'POST', body: formData });
+                return await resp.json();
+            } else {
+                const resp = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chatId: chatId, message: texto })
+                });
+                return await resp.json();
+            }
+        } catch (err) {
+            console.error(`❌ Erro WhatsApp (${chatId}):`, err);
+            return null;
         }
     }
 
@@ -134,7 +178,7 @@ exports.handler = async (event) => {
             return { statusCode: 400, body: "JSON Inválido" };
         }
 
-        const message = body.message || body.channel_post || body;
+        const message = body.message || body;
         if (!message) return { statusCode: 200, body: "Sem mensagem" };
 
         const textoOriginal = message.text || message.caption || "";
@@ -142,15 +186,58 @@ exports.handler = async (event) => {
 
         if (!chatOrigemId) return { statusCode: 200, body: "Sem chat de origem" };
 
-        // Pega a foto (seja mensagem normal ou encaminhada)
-        let fileIdFoto = null;
-        if (message.photo && message.photo.length > 0) {
-            fileIdFoto = message.photo[message.photo.length - 1].file_id;
+        const linhasMsg = textoOriginal.split('\n');
+        const primeiraLinha = linhasMsg[0].trim().toLowerCase();
+
+        // =================================================================
+        // CASO 1: ATIVAÇÃO DE CUPONS (#ativar)
+        // =================================================================
+        if (primeiraLinha === "#ativar") {
+            const linhasTratadas = linhasMsg.slice(1).map(l => l.trim()).filter(l => l.length > 0);
+           
+            let cuponsParaSalvar = [];
+            for (let i = 0; i < linhasTratadas.length; i++) {
+                let linhaAtual = linhasTratadas[i];
+               
+                if (linhasTratadas[i + 1] && linhasTratadas[i + 1].toUpperCase().startsWith("CUPOM:")) {
+                    let codigo = linhasTratadas[i + 1].split(":")[1].trim();
+                    cuponsParaSalvar.push(`${linhaAtual} | CODIGO:${codigo}`);
+                    i++;
+                } else if (!linhaAtual.toUpperCase().startsWith("CUPOM:")) {
+                    cuponsParaSalvar.push(linhaAtual);
+                }
+            }
+
+            for (let item of cuponsParaSalvar) {
+                if (!bancoDeCupons.includes(item)) bancoDeCupons.push(item);
+            }
+
+            if (chatOrigemId === String(DESTINO_ID)) {
+                await enviarTextoTelegram(chatOrigemId, "🚀 Cupons adicionados e ativos!");
+            }
+            return { statusCode: 200, body: "Cupons Ativados" };
         }
 
-        // 1. Trata o texto (remove carrinho e limpa links excedentes)
+        // =================================================================
+        // CASO 2: REMOÇÃO DE CUPONS (#cancelar)
+        // =================================================================
+        if (primeiraLinha === "#cancelar") {
+            const termoBusca = linhasMsg.slice(1).join(" ").trim().toLowerCase();
+            bancoDeCupons = bancoDeCupons.filter(c => !c.toLowerCase().includes(termoBusca));
+
+            if (chatOrigemId === String(DESTINO_ID)) {
+                await enviarTextoTelegram(chatOrigemId, "🛑 Cupons removidos!");
+            }
+            return { statusCode: 200, body: "Cupons Cancelados" };
+        }
+
+        // =================================================================
+        // CASO 3: MENSAGEM ENCAMINHADA / CUPOM DE OFERTA
+        // =================================================================
+        // Remove linhas de carrinho excedentes
         let textoTratado = textoOriginal.replace(/🛒 LINK CARRINHO:.*?\n?/gi, '');
 
+        // Substitui TODOS os links originais do texto pelo seu link fixo de afiliado
         const linksEncontrados = textoTratado.match(/https?:\/\/[^\s]+/g);
         if (linksEncontrados && linksEncontrados.length > 0) {
             textoTratado = textoTratado.replace(linksEncontrados[0], LINK_AFILIADO_FIXO);
@@ -161,23 +248,30 @@ exports.handler = async (event) => {
 
         textoTratado = textoTratado.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
 
-        // 2. Baixa e processa a foto
-        let bufferFotoFinal = null;
-        if (fileIdFoto) {
-            const fotoDownload = await baixarFotoTelegram(fileIdFoto);
-            if (fotoDownload && fotoDownload.buffer) {
-                bufferFotoFinal = await cortarImagemProduto(fotoDownload.buffer);
-            }
+        // Baixa a imagem oficial do GitHub e processa com o Jimp
+        let bufferCortado = null;
+        const bufferGitHub = await carregarImagemGitHub();
+        if (bufferGitHub) {
+            bufferCortado = await cortarImagemProduto(bufferGitHub);
         }
 
-        // 3. Envia para o grupo/canal de destino
-        if (bufferFotoFinal) {
-            await enviarFotoTelegram(DESTINO_ID, bufferFotoFinal, textoTratado);
+        // 1. Envio para o Telegram (Destino) com a imagem e o texto tratado
+        if (bufferCortado) {
+            await enviarFotoTelegram(DESTINO_ID, bufferCortado, textoTratado);
         } else {
             await enviarTextoTelegram(DESTINO_ID, textoTratado);
         }
 
-        return { statusCode: 200, body: "Processado com sucesso" };
+        // 2. Envio para os grupos do WhatsApp via Green-API -> BLOQUEADO/DESATIVADO TEMPORARIAMENTE
+        /*
+        const respostaWhatsapp = converterFormatacaoWhatsapp(textoTratado);
+        for (const chatId of WHATSAPP_CHAT_IDS) {
+            await enviarWhatsapp(respostaWhatsapp, chatId, bufferCortado);
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        */
+
+        return { statusCode: 200, body: "OK" };
     }
 
     return { statusCode: 200, body: "Servidor Ativo" };
